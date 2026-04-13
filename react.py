@@ -1,5 +1,5 @@
 from llm import HelloAgentsLLM
-from tool import ToolExecutor, search
+from tool import ToolExecutor, search, calculator
 import re
 
 # ReAct 提示词模板
@@ -28,6 +28,7 @@ class ReActAgent:
         self.tool_executor = tool_executor
         self.max_steps = max_steps
         self.history = []
+        self.max_tool_failures = 3
         
     def run(self, question: str):
         self.history = []
@@ -38,7 +39,7 @@ class ReActAgent:
             print(f"--- 第 {current_step} 步 ---")
 
             # 1. 格式化提示词
-            tools_desc = self.tool_executor.getAvailableTools()
+            tools_desc = self.tool_executor.getAvailableTools(query=question, max_tools=8)
             history_str = "\n".join(self.history)
             prompt = REACT_PROMPT_TEMPLATE.format(
                 tools=tools_desc,
@@ -79,7 +80,12 @@ class ReActAgent:
             
             tool_name, tool_input = self._parse_action(action)
             if not tool_name or not tool_input:
-                # ... 处理无效Action格式 ...
+                self._record_tool_failure(
+                    "动作格式错误",
+                    "Action 必须为 ToolName[tool_input] 或 Finish[answer]。",
+                )
+                if self._too_many_tool_failures():
+                    break
                 continue
 
             print(f"🎬 行动: {tool_name}[{tool_input}]")
@@ -87,8 +93,20 @@ class ReActAgent:
             tool_function = self.tool_executor.getTool(tool_name)
             if not tool_function:
                 observation = f"错误:未找到名为 '{tool_name}' 的工具。"
+                self._record_tool_failure(
+                    "工具不存在",
+                    f"可用工具仅有: {', '.join(self.tool_executor.tools.keys())}。",
+                )
+                if self._too_many_tool_failures():
+                    break
             else:
                 observation = tool_function(tool_input) # 调用真实工具
+                if isinstance(observation, str) and observation.startswith("错误:"):
+                    self._record_tool_failure("工具执行失败", observation)
+                    if self._too_many_tool_failures():
+                        break
+                else:
+                    self._clear_recent_tool_failures()
             
             print(f"👀 观察: {observation}")
             
@@ -99,6 +117,29 @@ class ReActAgent:
         # 循环结束
         print("已达到最大步数，流程终止。")
         return None
+
+    def _record_tool_failure(self, reason: str, detail: str):
+        guidance = (
+            "ToolFeedback: 你上一步工具调用失败。\n"
+            f"- 原因: {reason}\n"
+            f"- 细节: {detail}\n"
+            "- 纠正策略:\n"
+            "  1) 先检查可用工具名称是否精确匹配（区分大小写）。\n"
+            "  2) Action 格式必须是 ToolName[tool_input]。\n"
+            "  3) 计算问题优先使用 Calculator；事实检索问题优先使用 Search。\n"
+            "  4) 若信息已足够，输出 Finish[最终答案]。"
+        )
+        self.history.append(guidance)
+
+    def _too_many_tool_failures(self) -> bool:
+        recent_feedback = [item for item in self.history if item.startswith("ToolFeedback:")]
+        if len(recent_feedback) >= self.max_tool_failures:
+            print("警告:连续多次工具调用失败，流程终止。")
+            return True
+        return False
+
+    def _clear_recent_tool_failures(self):
+        self.history = [item for item in self.history if not item.startswith("ToolFeedback:")]
 
     def _parse_output(self, text: str):
         """解析LLM的输出，提取Thought和Action。
@@ -125,10 +166,22 @@ if __name__ == '__main__':
         
         toolExecutor = ToolExecutor()
         search_description = "一个网页搜索引擎。当你需要回答关于时事、事实以及在你的知识库中找不到的信息时，应使用此工具。"
-        toolExecutor.registerTool("Search", search_description, search)
+        toolExecutor.registerTool(
+            "Search",
+            search_description,
+            search,
+            keywords=["搜索", "时事", "新闻", "事实", "网页", "internet", "search"],
+        )
+        calculator_description = "一个数学计算器。输入数学表达式并返回结果，支持 + - * / // % ** 和括号。"
+        toolExecutor.registerTool(
+            "Calculator",
+            calculator_description,
+            calculator,
+            keywords=["数学", "计算", "表达式", "算术", "calculator", "math"],
+        )
         
         reactAgent = ReActAgent(llmClient, toolExecutor)
-        reactAgent.run("写一个希尔排序算法")
+        reactAgent.run("计算 (123 + 456) × 789 / 12 = ? 的结果")
     except ValueError as e:
         print(e)
     
